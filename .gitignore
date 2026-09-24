@@ -1,0 +1,15 @@
+# Terraform
+terraform/.terraform/
+terraform/terraform.tfstate
+terraform/terraform.tfstate.*
+terraform/.terraform.lock.hcl
+
+# Terraform variables / secrets
+terraform/terraform.tfvars
+terraform/*.tfvars
+terraform/*.tfvars.json
+
+# Snowflake private keys
+*.p8
+*_key
+*.key

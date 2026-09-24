@@ -1,0 +1,4 @@
+snowflake_organization       = "YOUR_ORGANIZATION"
+snowflake_account            = "YOUR_ACCOUNT"
+snowflake_user               = "KENDRIX_TERRAFORM"
+snowflake_private_key_path   = "~/.ssh/kendrix_snowflake_key"

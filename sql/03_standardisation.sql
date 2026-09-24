@@ -12,7 +12,9 @@
 --           STAGING.FN_IS_PLACEHOLDER_EMAIL (SQL UDFs)
 --           STAGING.ORGANISATION_STD - one row per source record
 --           one row in AUDIT.PIPELINE_RUN (step '03_standardisation')
--- Notes   : Idempotent (CREATE OR REPLACE). Rule version 'std_v2'.
+-- Notes   : Idempotent (CREATE OR REPLACE). Rule version 'std_v3'.
+--           std_v3: NZBN valid only if it starts with 94 (all real NZBNs do);
+--                   the placeholder '0000000000000' merged 7 unrelated charities
 --           std_v2: placeholder emails treated as missing (found by profiling)
 --           RAW is all VARCHAR and the source CSV quotes every field, so blanks
 --           are '' not NULL. Every source column goes through NULLIF(TRIM(col), '')
@@ -432,9 +434,13 @@ cleaned AS (
         NULLIF(SPLIT_PART(
             REGEXP_REPLACE(REGEXP_REPLACE(LOWER(u.WEBSITE_RAW), '^https?://', ''), '^www[.]', ''),
             '/', 1), '')                            AS WEBSITE_DOMAIN,
-        -- NZBN is always 13 digits; spaces are removed first because numbers are
-        -- sometimes typed in groups. Anything else is unusable as an ID.
-        IFF(REGEXP_LIKE(REPLACE(u.NZBN_RAW, ' ', ''), '^[0-9]{13}$'),
+        -- NZBN is always 13 digits and every real NZBN starts with 94; spaces
+        -- are removed first because numbers are sometimes typed in groups.
+        -- std_v3: the 94 prefix is required because the register uses
+        -- '0000000000000' as a placeholder. 13 digits alone let 7 unrelated
+        -- charities "share" that NZBN and be merged as one entity.
+        -- Anything else is unusable as an ID.
+        IFF(REGEXP_LIKE(REPLACE(u.NZBN_RAW, ' ', ''), '^94[0-9]{11}$'),
             REPLACE(u.NZBN_RAW, ' ', ''), NULL)     AS NZBN
     FROM unioned u
 )
@@ -474,7 +480,11 @@ SELECT
         -- value is fine, it just cannot be compared with NZ numbers.
         IFF(IS_OVERSEAS_PHONE, 'OVERSEAS_PHONE', NULL),
         IFF(PHONE_RAW IS NOT NULL AND PHONE_CLEAN IS NULL AND NOT IS_OVERSEAS_PHONE, 'INVALID_PHONE', NULL),
-        IFF(NZBN_RAW IS NOT NULL AND NZBN IS NULL, 'INVALID_NZBN', NULL),
+        -- An all-zero NZBN is a placeholder ("no NZBN"), not a typo, so it
+        -- gets its own flag; any other rejected value is INVALID_NZBN.
+        IFF(NZBN_RAW IS NOT NULL AND NZBN IS NULL,
+            IFF(REGEXP_LIKE(REPLACE(NZBN_RAW, ' ', ''), '^0+$'), 'PLACEHOLDER_NZBN', 'INVALID_NZBN'),
+            NULL),
         IFF(NZBN IS NULL, 'MISSING_NZBN', NULL),
         IFF(REGISTERED_DATE_RAW IS NOT NULL AND REGISTERED_DATE IS NULL, 'INVALID_DATE', NULL)
     ))::ARRAY                                       AS DQ_FLAGS,
@@ -490,7 +500,7 @@ INSERT INTO AUDIT.PIPELINE_RUN (RUN_ID, STEP, STARTED_AT, FINISHED_AT, ROWS_OUT,
 SELECT $RUN_ID, '03_standardisation',
        $STARTED_AT,
        CURRENT_TIMESTAMP()::TIMESTAMP_NTZ,
-       c.n + co.n, 'std_v2',
+       c.n + co.n, 'std_v3',
        IFF(c.n = 46045 AND co.n = 1664, 'SUCCESS', 'FAIL'),
        'charities=' || c.n || ', companies_office=' || co.n
 FROM (SELECT COUNT(*) n FROM STAGING.ORGANISATION_STD WHERE SOURCE_SYSTEM = 'CHARITIES_REGISTER') c,

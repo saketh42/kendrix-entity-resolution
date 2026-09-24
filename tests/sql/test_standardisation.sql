@@ -49,6 +49,13 @@ SELECT RECORD_KEY, NZBN
 FROM STAGING.ORGANISATION_STD
 WHERE NZBN IS NOT NULL AND NOT REGEXP_LIKE(NZBN, '^[0-9]{13}$');
 
+-- Test: nzbn_not_94_prefix -- every real NZBN starts with 94. Anything else
+-- (e.g. the placeholder '0000000000000' that merged 7 unrelated charities)
+-- must have been set to NULL.
+SELECT RECORD_KEY, NZBN
+FROM STAGING.ORGANISATION_STD
+WHERE NZBN IS NOT NULL AND NOT REGEXP_LIKE(NZBN, '^94[0-9]{11}$');
+
 -- Test: empty_strings_left -- blanks must be NULL, otherwise blank values
 -- would "match" each other in later steps.
 SELECT RECORD_KEY, NZBN, PHONE_CLEAN, EMAIL_CLEAN, POSTCODE
@@ -127,6 +134,10 @@ nzbn_not_13_digits AS (
     SELECT RECORD_KEY FROM STAGING.ORGANISATION_STD
     WHERE NZBN IS NOT NULL AND NOT REGEXP_LIKE(NZBN, '^[0-9]{13}$')
 ),
+nzbn_not_94_prefix AS (
+    SELECT RECORD_KEY FROM STAGING.ORGANISATION_STD
+    WHERE NZBN IS NOT NULL AND NOT REGEXP_LIKE(NZBN, '^94[0-9]{11}$')
+),
 empty_strings_left AS (
     SELECT RECORD_KEY FROM STAGING.ORGANISATION_STD
     WHERE NZBN = '' OR PHONE_CLEAN = '' OR EMAIL_CLEAN = '' OR POSTCODE = ''
@@ -164,6 +175,7 @@ UNION ALL SELECT 'matchable_without_name', COUNT(*) FROM matchable_without_name
 UNION ALL SELECT 'postcode_not_4_digits',  COUNT(*) FROM postcode_not_4_digits
 UNION ALL SELECT 'phone_non_digits',       COUNT(*) FROM phone_non_digits
 UNION ALL SELECT 'nzbn_not_13_digits',     COUNT(*) FROM nzbn_not_13_digits
+UNION ALL SELECT 'nzbn_not_94_prefix',     COUNT(*) FROM nzbn_not_94_prefix
 UNION ALL SELECT 'empty_strings_left',     COUNT(*) FROM empty_strings_left
 UNION ALL SELECT 'placeholder_email_left', COUNT(*) FROM placeholder_email_left
 UNION ALL SELECT 'name_rules',             COUNT(*) FROM name_rules

@@ -42,6 +42,18 @@ WHERE NAME_JW      NOT BETWEEN 0 AND 100
    OR ALT_NAME_JW  NOT BETWEEN 0 AND 100
    OR ADDRESS_JW   NOT BETWEEN 0 AND 100;
 
+-- Test: jw_rev_out_of_range -- the reversed-name Jaro-Winkler is also 0-100
+-- (NULL is allowed: a side has no NAME_CORE).
+SELECT PAIR_ID, NAME_CORE_JW_REV
+FROM CURATED.MATCH_FEATURE
+WHERE NAME_CORE_JW_REV NOT BETWEEN 0 AND 100;
+
+-- Test: jaccard_out_of_range -- word overlap is a share, so always 0-1
+-- (NULL is allowed: a side has no name words).
+SELECT PAIR_ID, NAME_TOKEN_JACCARD
+FROM CURATED.MATCH_FEATURE
+WHERE NAME_TOKEN_JACCARD NOT BETWEEN 0 AND 1;
+
 -- Test: eq_true_but_values_differ -- spot-check: PHONE_EQ = TRUE must mean the
 -- two cleaned phone numbers really are identical.
 SELECT f.PAIR_ID, l.PHONE_CLEAN AS LEFT_PHONE, r.PHONE_CLEAN AS RIGHT_PHONE
@@ -112,6 +124,14 @@ jw_out_of_range AS (
        OR ALT_NAME_JW  NOT BETWEEN 0 AND 100
        OR ADDRESS_JW   NOT BETWEEN 0 AND 100
 ),
+jw_rev_out_of_range AS (
+    SELECT PAIR_ID FROM CURATED.MATCH_FEATURE
+    WHERE NAME_CORE_JW_REV NOT BETWEEN 0 AND 100
+),
+jaccard_out_of_range AS (
+    SELECT PAIR_ID FROM CURATED.MATCH_FEATURE
+    WHERE NAME_TOKEN_JACCARD NOT BETWEEN 0 AND 1
+),
 eq_true_but_values_differ AS (
     SELECT PAIR_ID FROM pair_sides
     WHERE PHONE_EQ AND L_PHONE <> R_PHONE
@@ -126,6 +146,8 @@ generic_email_used AS (
 )
 SELECT 'one_row_per_pair'           AS test_name, COUNT(*) AS failure_count FROM one_row_per_pair
 UNION ALL SELECT 'jw_out_of_range',            COUNT(*) FROM jw_out_of_range
+UNION ALL SELECT 'jw_rev_out_of_range',        COUNT(*) FROM jw_rev_out_of_range
+UNION ALL SELECT 'jaccard_out_of_range',       COUNT(*) FROM jaccard_out_of_range
 UNION ALL SELECT 'eq_true_but_values_differ',  COUNT(*) FROM eq_true_but_values_differ
 UNION ALL SELECT 'eq_not_null_when_missing',   COUNT(*) FROM eq_not_null_when_missing
 UNION ALL SELECT 'generic_email_used',         COUNT(*) FROM generic_email_used;

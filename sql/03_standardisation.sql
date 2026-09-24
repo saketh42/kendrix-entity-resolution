@@ -8,10 +8,12 @@
 --           RAW.COMPANIES_OFFICE        (2,000 rows, 1,664 unique NZBN)
 -- Outputs : STAGING.FN_NAME_CLEAN, STAGING.FN_NAME_CORE,
 --           STAGING.FN_PLACE_CLEAN, STAGING.FN_ADDRESS_CLEAN,
---           STAGING.FN_PHONE_IS_OVERSEAS, STAGING.FN_PHONE_CLEAN (SQL UDFs)
+--           STAGING.FN_PHONE_IS_OVERSEAS, STAGING.FN_PHONE_CLEAN,
+--           STAGING.FN_IS_PLACEHOLDER_EMAIL (SQL UDFs)
 --           STAGING.ORGANISATION_STD - one row per source record
 --           one row in AUDIT.PIPELINE_RUN (step '03_standardisation')
--- Notes   : Idempotent (CREATE OR REPLACE). Rule version 'std_v1'.
+-- Notes   : Idempotent (CREATE OR REPLACE). Rule version 'std_v2'.
+--           std_v2: placeholder emails treated as missing (found by profiling)
 --           RAW is all VARCHAR and the source CSV quotes every field, so blanks
 --           are '' not NULL. Every source column goes through NULLIF(TRIM(col), '')
 --           first, otherwise blank phones/emails would "match" each other.
@@ -198,6 +200,23 @@ $$
 $$;
 
 -- -----------------------------------------------------------------------------
+-- 4d) Placeholder emails. The charities register puts a dummy address in the
+--     email field when a charity has none. Profiling (AUDIT.DQ_PROFILE) found
+--     'nocharityemail@dia.govt.nz' (94 records) and 'noaddress@charities.govt.nz'
+--     (73). They are not real contacts: kept, they would make unrelated
+--     charities look like they share an email. Add new placeholders here only.
+--     COALESCE turns a NULL input into FALSE, so the result is safe inside IFF.
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION STAGING.FN_IS_PLACEHOLDER_EMAIL(S VARCHAR)
+RETURNS BOOLEAN
+LANGUAGE SQL
+AS
+$$
+    COALESCE(LOWER(TRIM(S)) IN ('nocharityemail@dia.govt.nz',
+                                'noaddress@charities.govt.nz'), FALSE)
+$$;
+
+-- -----------------------------------------------------------------------------
 -- 5) STAGING.ORGANISATION_STD: one row per source record, same columns for
 --    every source. Each source is mapped to a common shape in its own CTEs,
 --    then the shared cleaning rules are applied ONCE to the union.
@@ -262,7 +281,11 @@ chr_std AS (
         IFF(STREETADDRESSLINE1 IS NOT NULL, STREETADDRESSPOSTCODE, POSTALADDRESSPOSTCODE) AS POSTCODE_RAW,
         TELEPHONE1                                  AS PHONE_RAW,
         -- EMAILADDRESS1 is the main contact; CHARITYEMAILADDRESS fills gaps.
-        COALESCE(EMAILADDRESS1, CHARITYEMAILADDRESS) AS EMAIL_RAW,
+        -- Placeholders (4d) are removed from each column BEFORE the fallback,
+        -- so a real CHARITYEMAILADDRESS is still used when EMAILADDRESS1 is a dummy.
+        COALESCE(IFF(STAGING.FN_IS_PLACEHOLDER_EMAIL(EMAILADDRESS1), NULL, EMAILADDRESS1),
+                 IFF(STAGING.FN_IS_PLACEHOLDER_EMAIL(CHARITYEMAILADDRESS), NULL, CHARITYEMAILADDRESS))
+                                                    AS EMAIL_RAW,
         WEBSITEURL                                  AS WEBSITE_RAW,
         UPPER(REGISTRATIONSTATUS)                   AS ENTITY_STATUS,
         DATEREGISTERED                              AS REGISTERED_DATE_RAW,
@@ -271,7 +294,10 @@ chr_std AS (
         -- Flag only when postal data was actually used (a record with no
         -- address at all is not "from postal").
         ARRAY_CONSTRUCT_COMPACT(
-            IFF(STREETADDRESSLINE1 IS NULL AND POSTALADDRESSLINE1 IS NOT NULL, 'ADDRESS_FROM_POSTAL', NULL)
+            IFF(STREETADDRESSLINE1 IS NULL AND POSTALADDRESSLINE1 IS NOT NULL, 'ADDRESS_FROM_POSTAL', NULL),
+            -- Record that a placeholder email was dropped, so it is visible in DQ_FLAGS.
+            IFF(STAGING.FN_IS_PLACEHOLDER_EMAIL(EMAILADDRESS1)
+                OR STAGING.FN_IS_PLACEHOLDER_EMAIL(CHARITYEMAILADDRESS), 'PLACEHOLDER_EMAIL', NULL)
         )                                           AS SOURCE_FLAGS
     FROM chr_src
 ),
@@ -464,7 +490,7 @@ INSERT INTO AUDIT.PIPELINE_RUN (RUN_ID, STEP, STARTED_AT, FINISHED_AT, ROWS_OUT,
 SELECT $RUN_ID, '03_standardisation',
        $STARTED_AT,
        CURRENT_TIMESTAMP()::TIMESTAMP_NTZ,
-       c.n + co.n, 'std_v1',
+       c.n + co.n, 'std_v2',
        IFF(c.n = 46045 AND co.n = 1664, 'SUCCESS', 'FAIL'),
        'charities=' || c.n || ', companies_office=' || co.n
 FROM (SELECT COUNT(*) n FROM STAGING.ORGANISATION_STD WHERE SOURCE_SYSTEM = 'CHARITIES_REGISTER') c,

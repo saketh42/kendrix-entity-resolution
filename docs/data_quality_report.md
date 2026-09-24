@@ -103,7 +103,7 @@ Companies Office entity types (`entity_type=<value>`, raw rows): Incorporated So
 | `+64` / `0064` phones | Converted to local `0...` format | `STAGING.FN_PHONE_CLEAN` |
 | Overseas phones | Not compared; flagged `OVERSEAS_PHONE` | `STAGING.FN_PHONE_IS_OVERSEAS` |
 | Generic and shared email domains | Not used as match evidence | `IS_GENERIC_EMAIL_DOMAIN` |
-| Placeholder emails (nocharityemail@dia.govt.nz 94, noaddress@charities.govt.nz 73) | Treated as missing so they cannot create false matches; flag `PLACEHOLDER_EMAIL` | `sql/03_standardisation.sql` (fix pending) |
+| Placeholder emails (nocharityemail@dia.govt.nz 94, noaddress@charities.govt.nz 73) | Treated as missing so they cannot create false matches; flag `PLACEHOLDER_EMAIL` | `sql/03_standardisation.sql` (fixed in std_v2: 169 records, removed 6,922 false candidate pairs (230,880 -> 223,958)) |
 | Group-member reg numbers (`CC11026-1`) | Parent number kept separately to link members to their parent | `CHARITY_PARENT_REG_NO` |
 
 Cleaning outcome counts from staging (`dq_flag=<FLAG>`, `not_matchable`):

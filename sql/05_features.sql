@@ -10,7 +10,10 @@
 -- Outputs : CURATED.MATCH_FEATURE    - one row per candidate pair
 --           one row in AUDIT.PIPELINE_RUN (step '05_features')
 -- Notes   : Idempotent: new columns use ADD COLUMN IF NOT EXISTS, and the table
---           is truncated and fully rebuilt on every run. Rule version 'feat_v1'.
+--           is truncated and fully rebuilt on every run. Rule version 'feat_v2'.
+--           feat_v2: NAME_TOKEN_JACCARD is computed for every pair (main name
+--           vs main name always, plus main vs alt names; never alt vs alt),
+--           and new NZBN_SHARED_COUNT / COMPANY_NO_SHARED_COUNT columns.
 --           NULL in any *_EQ column means "no evidence" (a side is missing the
 --           value), NOT "different". Step 06 must treat NULL and FALSE differently.
 --           Tests: tests/sql/test_features.sql.
@@ -53,7 +56,16 @@ ALTER TABLE CURATED.MATCH_FEATURE ADD COLUMN IF NOT EXISTS ADDRESS_SHARED_COUNT 
 -- share start AND end but differ in the key word (place, hapu, activity):
 -- 'NGATI TU HAPU' vs 'NGATI HAUA HAPU' = 2 shared of 4 distinct words = 0.5.
 ALTER TABLE CURATED.MATCH_FEATURE ADD COLUMN IF NOT EXISTS NAME_TOKEN_JACCARD NUMBER(5,2)
-    COMMENT 'Best word-overlap (Jaccard, 0-1) over all core names/alt names of the two sides: shared distinct words / all distinct words';
+    COMMENT 'Best word-overlap (Jaccard, 0-1): main core name vs main core name, or main vs the other side''s alt names (never alt vs alt): shared distinct words / all distinct words';
+-- A real identifier belongs to one entity. An NZBN or Companies Office number
+-- carried by many records is a parent/umbrella body's ID (e.g. every St John
+-- area committee carries the parent's company number), so equality on it says
+-- "same group", not "same organisation". Step 06 uses these counts to tell
+-- the two apart, the same way it treats widely shared emails and addresses.
+ALTER TABLE CURATED.MATCH_FEATURE ADD COLUMN IF NOT EXISTS NZBN_SHARED_COUNT NUMBER
+    COMMENT 'How many ORGANISATION_STD records have this NZBN (only when NZBN_EQ); 2 = only this pair, high = parent/umbrella ID';
+ALTER TABLE CURATED.MATCH_FEATURE ADD COLUMN IF NOT EXISTS COMPANY_NO_SHARED_COUNT NUMBER
+    COMMENT 'How many ORGANISATION_STD records have this COMPANY_NO (only when COMPANY_NO_EQ); 2 = only this pair, high = parent/umbrella ID';
 
 -- -----------------------------------------------------------------------------
 -- 2) Rebuild the features: one row per candidate pair.
@@ -65,7 +77,8 @@ INSERT INTO CURATED.MATCH_FEATURE (
     POSTCODE_EQ, CITY_EQ, PHONE_EQ, EMAIL_EQ, WEBSITE_EQ, NZBN_EQ, COMPANY_NO_EQ,
     EMAIL_SHARED_COUNT, PHONE_SHARED_COUNT, WEBSITE_SHARED_COUNT,
     SAME_PARENT_CHARITY, RUN_ID, COMPUTED_AT,
-    NAME_CORE_JW_REV, ADDRESS_SHARED_COUNT, NAME_TOKEN_JACCARD
+    NAME_CORE_JW_REV, ADDRESS_SHARED_COUNT, NAME_TOKEN_JACCARD,
+    NZBN_SHARED_COUNT, COMPANY_NO_SHARED_COUNT
 )
 WITH
 -- Both records of every pair side by side (L_ = left record, R_ = right record).
@@ -120,6 +133,18 @@ address_counts AS (
     WHERE ADDRESS_LINE_CLEAN IS NOT NULL AND POSTCODE IS NOT NULL
     GROUP BY 1
 ),
+nzbn_counts AS (
+    SELECT NZBN AS VAL, COUNT(*) AS N
+    FROM STAGING.ORGANISATION_STD
+    WHERE NZBN IS NOT NULL
+    GROUP BY NZBN
+),
+company_no_counts AS (
+    SELECT COMPANY_NO AS VAL, COUNT(*) AS N
+    FROM STAGING.ORGANISATION_STD
+    WHERE COMPANY_NO IS NOT NULL
+    GROUP BY COMPANY_NO
+),
 
 -- Pairs where at least one side has alternative names (other/trading/former).
 -- ALT_NAMES is [] (not NULL) when there are none, hence ARRAY_SIZE. Pairs with
@@ -162,18 +187,31 @@ alt_name_best AS (
     GROUP BY pa.PAIR_ID
 ),
 
--- Word sets of every core name of every record in a pair: NAME_CORE (or
--- NAME_CLEAN if the core is empty) plus the core of each alt name (same
--- FN_NAME_CORE rule as sql/04), so legal-form words like 'TRUST' or
--- 'INCORPORATED' do not count as shared words. ARRAY_DISTINCT once here, so
--- each word counts once.
-record_word_sets AS (
-    SELECT s.RECORD_KEY, ARRAY_DISTINCT(SPLIT(COALESCE(s.NAME_CORE, s.NAME_CLEAN), ' ')) AS WORDS
-    FROM STAGING.ORGANISATION_STD s
-    WHERE COALESCE(s.NAME_CORE, s.NAME_CLEAN) IS NOT NULL
-      AND s.RECORD_KEY IN (SELECT LEFT_KEY FROM pairs UNION SELECT RIGHT_KEY FROM pairs)
-    UNION ALL
-    SELECT s.RECORD_KEY, ARRAY_DISTINCT(SPLIT(STAGING.FN_NAME_CORE(f.VALUE::VARCHAR), ' '))
+-- Word overlap (Jaccard) = shared distinct words / all distinct words of two
+-- names, 0-1. Names are compared as core names (NAME_CORE, or NAME_CLEAN if
+-- the core is empty; alt names through the same FN_NAME_CORE rule as sql/04),
+-- so legal-form words like 'TRUST' or 'INCORPORATED' do not count as shared
+-- words. ARRAY_DISTINCT makes each word count once.
+-- feat_v2: three steps, so that
+--  - EVERY pair gets a value: main vs main is computed straight from the
+--    pairs CTE (every paired record is matchable, so it has a name). A NULL
+--    here used to let 06's word-overlap gates be skipped;
+--  - alt names can still help (a former/trading name vs the other side's
+--    current name), but only main vs alt, NEVER alt vs alt: branches often
+--    share a parent alias (e.g. 'Order of St John'), which would make
+--    different branches look identical.
+
+-- Step 1: each side's main word set.
+pair_main_words AS (
+    SELECT PAIR_ID, LEFT_KEY, RIGHT_KEY,
+           ARRAY_DISTINCT(SPLIT(COALESCE(L_CORE, L_NAME), ' ')) AS L_WORDS,
+           ARRAY_DISTINCT(SPLIT(COALESCE(R_CORE, R_NAME), ' ')) AS R_WORDS
+    FROM pairs
+),
+
+-- Step 2: word set of each alt name of every record in a pair.
+alt_word_sets AS (
+    SELECT s.RECORD_KEY, ARRAY_DISTINCT(SPLIT(STAGING.FN_NAME_CORE(f.VALUE::VARCHAR), ' ')) AS WORDS
     FROM STAGING.ORGANISATION_STD s,
          LATERAL FLATTEN(INPUT => s.ALT_NAMES) f
     WHERE f.VALUE IS NOT NULL
@@ -181,22 +219,38 @@ record_word_sets AS (
       AND s.RECORD_KEY IN (SELECT LEFT_KEY FROM pairs UNION SELECT RIGHT_KEY FROM pairs)
 ),
 
--- Jaccard = shared distinct words / all distinct words of the two names, 0-1.
--- Best over every name combination, like ALT_NAME_JW.
+-- Step 3: one Jaccard per allowed combination, then the best per pair.
+jaccard_combos AS (
+    -- main vs main: always present
+    SELECT PAIR_ID,
+           ARRAY_SIZE(ARRAY_INTERSECTION(L_WORDS, R_WORDS))
+           / NULLIF(ARRAY_SIZE(ARRAY_DISTINCT(ARRAY_CAT(L_WORDS, R_WORDS))), 0) AS J
+    FROM pair_main_words
+    UNION ALL
+    -- left main vs right alt names
+    SELECT m.PAIR_ID,
+           ARRAY_SIZE(ARRAY_INTERSECTION(m.L_WORDS, ra.WORDS))
+           / NULLIF(ARRAY_SIZE(ARRAY_DISTINCT(ARRAY_CAT(m.L_WORDS, ra.WORDS))), 0)
+    FROM pair_main_words m
+    JOIN alt_word_sets ra ON ra.RECORD_KEY = m.RIGHT_KEY
+    UNION ALL
+    -- left alt names vs right main
+    SELECT m.PAIR_ID,
+           ARRAY_SIZE(ARRAY_INTERSECTION(la.WORDS, m.R_WORDS))
+           / NULLIF(ARRAY_SIZE(ARRAY_DISTINCT(ARRAY_CAT(la.WORDS, m.R_WORDS))), 0)
+    FROM pair_main_words m
+    JOIN alt_word_sets la ON la.RECORD_KEY = m.LEFT_KEY
+),
 name_jaccard AS (
-    SELECT p.PAIR_ID,
-           MAX(ARRAY_SIZE(ARRAY_INTERSECTION(lw.WORDS, rw.WORDS))
-               / NULLIF(ARRAY_SIZE(ARRAY_DISTINCT(ARRAY_CAT(lw.WORDS, rw.WORDS))), 0)) AS NAME_TOKEN_JACCARD
-    FROM pairs p
-    JOIN record_word_sets lw ON lw.RECORD_KEY = p.LEFT_KEY
-    JOIN record_word_sets rw ON rw.RECORD_KEY = p.RIGHT_KEY
-    GROUP BY p.PAIR_ID
+    SELECT PAIR_ID, MAX(J) AS NAME_TOKEN_JACCARD
+    FROM jaccard_combos
+    GROUP BY PAIR_ID
 ),
 
 features AS (
     SELECT
         p.PAIR_ID,
-        p.L_EMAIL, p.L_PHONE, p.L_WEB,
+        p.L_EMAIL, p.L_PHONE, p.L_WEB, p.L_NZBN, p.L_CO,
         -- NULL unless the side has both parts (then no address count is joined).
         p.L_ADDR || '|' || p.L_PC                   AS L_ADDR_KEY,
         p.R_ADDR || '|' || p.R_PC                   AS R_ADDR_KEY,
@@ -260,11 +314,15 @@ SELECT
     -- addresses says little about identity.
     IFF(la.N IS NOT NULL AND ra.N IS NOT NULL, GREATEST(la.N, ra.N), NULL)
                                                     AS ADDRESS_SHARED_COUNT,
-    f.NAME_TOKEN_JACCARD
+    f.NAME_TOKEN_JACCARD,
+    nc.N                                            AS NZBN_SHARED_COUNT,
+    cc.N                                            AS COMPANY_NO_SHARED_COUNT
 FROM features f
 LEFT JOIN email_counts   ec ON ec.VAL = f.L_EMAIL AND f.EMAIL_EQ
 LEFT JOIN phone_counts   pc ON pc.VAL = f.L_PHONE AND f.PHONE_EQ
 LEFT JOIN website_counts wc ON wc.VAL = f.L_WEB   AND f.WEBSITE_EQ
+LEFT JOIN nzbn_counts       nc ON nc.VAL = f.L_NZBN AND f.NZBN_EQ
+LEFT JOIN company_no_counts cc ON cc.VAL = f.L_CO   AND f.COMPANY_NO_EQ
 LEFT JOIN address_counts la ON la.VAL = f.L_ADDR_KEY
 LEFT JOIN address_counts ra ON ra.VAL = f.R_ADDR_KEY;
 
@@ -276,7 +334,7 @@ INSERT INTO AUDIT.PIPELINE_RUN (RUN_ID, STEP, STARTED_AT, FINISHED_AT, ROWS_OUT,
 SELECT $RUN_ID, '05_features',
        $STARTED_AT,
        CURRENT_TIMESTAMP()::TIMESTAMP_NTZ,
-       f.n, 'feat_v1',
+       f.n, 'feat_v2',
        IFF(f.n = p.n AND f.n > 0, 'SUCCESS', 'FAIL'),
        'pairs=' || p.n
 FROM (SELECT COUNT(*) n FROM CURATED.MATCH_FEATURE) f,

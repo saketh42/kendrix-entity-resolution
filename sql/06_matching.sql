@@ -13,7 +13,13 @@
 --           AUDIT.EXCEPTION_QUEUE    - pairs that need a human decision
 --           one row in AUDIT.PIPELINE_RUN (step '06_matching')
 -- Notes   : Idempotent: new columns use ADD COLUMN IF NOT EXISTS, output tables
---           are truncated and fully rebuilt on every run. Rule version 'score_v4'.
+--           are truncated and fully rebuilt on every run. Rule version 'score_v5'.
+--           v5 (after golden-record review of v4: different St John area
+--           committees with no NZBN auto-merged through a shared COMPANY_NO,
+--           which is the parent entity's number): every word-overlap gate
+--           treats a missing NAME_TOKEN_JACCARD as 0 (fail, not skip), and an
+--           ID match only auto-merges if that ID is on at most ID_SHARED_MAX
+--           records; a more widely shared ID goes to REVIEW.
 --           v4 (after results review of v3: ID_MATCH merged branches of one
 --           legal entity, e.g. 'St John Kawhia Area Committee' <-> 'St John
 --           Murupara Area Committee', same NZBN): an ID match whose names share
@@ -44,7 +50,7 @@ USE DATABASE KENDRIX;
 -- SET only accepts constants or subqueries, so function calls are wrapped in (SELECT ...).
 SET RUN_ID = (SELECT UUID_STRING());
 SET STARTED_AT = (SELECT CURRENT_TIMESTAMP()::TIMESTAMP_NTZ);
-SET RULE_VERSION = 'score_v4';
+SET RULE_VERSION = 'score_v5';
 
 -- -----------------------------------------------------------------------------
 -- 0) ALL weights and thresholds, in one place. Change them here only.
@@ -102,6 +108,13 @@ SET LOW_JACCARD_NAME_CAP = 70;
 SET RARE_MAX       = 3;
 SET SHARED_MAX     = 10;
 SET RARITY_SHARED  = 0.5;
+
+-- v5: an identifier (NZBN / company number) shared by more records than this
+-- is a parent or umbrella body's ID, not an identity: every St John area
+-- committee carries the parent's company number. An ID shared by many records
+-- is not an identity, the same rule we apply to emails and addresses above,
+-- so such a pair goes to REVIEW instead of ID_MATCH. Same limit as RARE_MAX.
+SET ID_SHARED_MAX  = 3;
 
 -- Decision thresholds.
 -- AUTO_MATCH needs a high overall score AND a high name AND one agreeing
@@ -231,8 +244,9 @@ rarity AS (
 -- COALESCEs: NAME_JW covers a missing NAME_CORE, and a missing reversed score
 -- falls back to the forward one.
 -- v3: if the names share fewer than LOW_JACCARD of their words, the result is
--- capped at LOW_JACCARD_NAME_CAP. A NULL Jaccard (no words) makes the
--- IFF condition NULL, which is treated as false, so there is no cap: no evidence either way.
+-- capped at LOW_JACCARD_NAME_CAP.
+-- v5: a NULL Jaccard counts as 0 (so the cap applies): a missing value must
+-- fail a gate, never skip it.
 name_sim AS (
     SELECT r.*,
            GREATEST(
@@ -244,7 +258,7 @@ name_sim AS (
 ),
 ev_name AS (
     SELECT PAIR_ID, 'NAME_BEST_JW' AS FEATURE, L_NAME AS LEFT_VALUE, R_NAME AS RIGHT_VALUE,
-           IFF(NAME_TOKEN_JACCARD < $LOW_JACCARD,
+           IFF(COALESCE(NAME_TOKEN_JACCARD, 0) < $LOW_JACCARD,
                LEAST(NAME_SIM_UNCAPPED, $LOW_JACCARD_NAME_CAP),
                NAME_SIM_UNCAPPED) AS SIMILARITY,
            $W_NAME AS EFF_WEIGHT, TRUE AS IN_SCORE
@@ -374,6 +388,13 @@ fuzzy_decided AS (
         fz.PAIR_ID, fz.FUZZY_SCORE, fz.NAME_SCORE, fz.HAS_SECOND_EVIDENCE,
         (fz.HAS_SHARED_CONTACT AND NOT fz.HAS_SECOND_EVIDENCE)      AS HAS_SHARED_CONTACT_ONLY,
         mf.NZBN_EQ, mf.COMPANY_NO_EQ, mf.SAME_PARENT_CHARITY, mf.NAME_TOKEN_JACCARD,
+        -- v5: how many records carry the identifier that would drive an ID
+        -- match: the NZBN when it matches, otherwise the company number (only
+        -- used when there is no NZBN evidence, same as rule a below).
+        CASE
+            WHEN mf.NZBN_EQ                                  THEN mf.NZBN_SHARED_COUNT
+            WHEN mf.COMPANY_NO_EQ AND mf.NZBN_EQ IS NULL     THEN mf.COMPANY_NO_SHARED_COUNT
+        END                                                         AS ID_SHARED_COUNT,
         COALESCE(tr.REASONS, ARRAY_CONSTRUCT())                     AS REASONS,
         -- Gates on top of the score: a high score from the name alone must
         -- not auto-merge; it falls through to REVIEW instead (a score >=
@@ -404,10 +425,16 @@ with_path AS (
             --    charity (names share < AUTO_JACCARD of their words) is
             --    likely a branch; a human decides whether to merge. The same
             --    AUTO_JACCARD as the fuzzy gate, so there is ONE word-overlap
-            --    threshold for every auto-merge. A NULL Jaccard (no words to
-            --    compare) does not block the ID match.
+            --    threshold for every auto-merge.
+            --    v5: a NULL Jaccard counts as 0, so it now fails the gate
+            --    (before, NULL < 0.75 was not true and the gate was skipped).
+            --    v5: an ID on more than ID_SHARED_MAX records is a parent /
+            --    umbrella ID (see ID_SHARED_MAX): also REVIEW, same path and
+            --    queue reason (SHARED_LEGAL_ENTITY). A missing count also
+            --    fails, so the gate is never skipped.
             WHEN (fd.NZBN_EQ OR (fd.COMPANY_NO_EQ AND fd.NZBN_EQ IS NULL))
-             AND fd.NAME_TOKEN_JACCARD < $AUTO_JACCARD              THEN 'ID_MATCH_NAME_DIFFERS'
+             AND (COALESCE(fd.NAME_TOKEN_JACCARD, 0) < $AUTO_JACCARD
+                  OR NOT COALESCE(fd.ID_SHARED_COUNT <= $ID_SHARED_MAX, FALSE)) THEN 'ID_MATCH_NAME_DIFFERS'
             WHEN fd.NZBN_EQ
               OR (fd.COMPANY_NO_EQ AND fd.NZBN_EQ IS NULL)          THEN 'ID_MATCH'
             -- b. Both sides have an NZBN and they differ: strong evidence of two
@@ -493,7 +520,8 @@ SELECT
     NULL,
     CASE
         WHEN DECISION = 'REVIEW' AND DECISION_PATH = 'ID_CONFLICT_REVIEW' THEN 'ID_CONFLICT_HIGH_NAME'
-        -- Same legal entity/NZBN but a differently named registered charity:
+        -- Same legal entity/NZBN but a differently named registered charity,
+        -- or (v5) an ID shared by many records (parent/umbrella ID):
         -- likely a branch; a human decides whether to merge.
         WHEN DECISION = 'REVIEW' AND DECISION_PATH = 'ID_MATCH_NAME_DIFFERS' THEN 'SHARED_LEGAL_ENTITY'
         WHEN DECISION = 'REVIEW'                                         THEN 'BORDERLINE_SCORE'

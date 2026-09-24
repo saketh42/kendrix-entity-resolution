@@ -114,13 +114,26 @@ WHERE d.DECISION_PATH = 'FUZZY'
 -- differently named charities ('St John Kawhia Area Committee' vs 'St John
 -- Murupara Area Committee'). An ID-based AUTO_MATCH must share at least 75%
 -- of its distinct name words (the same threshold as the fuzzy AUTO_MATCH
--- gate); otherwise it belongs in REVIEW.
+-- gate); otherwise it belongs in REVIEW. A NULL overlap counts as 0 (v5: a
+-- missing value fails the gate instead of skipping it).
 SELECT d.PAIR_ID, d.DECISION_PATH, f.NAME_TOKEN_JACCARD
 FROM CURATED.MATCH_DECISION d
 JOIN CURATED.MATCH_FEATURE f ON f.PAIR_ID = d.PAIR_ID
 WHERE d.DECISION = 'AUTO_MATCH'
   AND d.DECISION_PATH IN ('ID_MATCH', 'ID_MATCH_NAME_DIFFERS', 'ID_CONFLICT', 'ID_CONFLICT_REVIEW')
-  AND f.NAME_TOKEN_JACCARD < 0.75;
+  AND COALESCE(f.NAME_TOKEN_JACCARD, 0) < 0.75;
+
+-- Test: auto_via_widely_shared_id -- the v4 St John merges: area committees
+-- with no NZBN auto-merged through the parent's shared company number. An
+-- ID-based AUTO_MATCH is only allowed when the ID that drove it (the NZBN, or
+-- the company number when there is no NZBN evidence) is on at most 3 records.
+SELECT d.PAIR_ID, d.DECISION_PATH, f.NZBN_SHARED_COUNT, f.COMPANY_NO_SHARED_COUNT
+FROM CURATED.MATCH_DECISION d
+JOIN CURATED.MATCH_FEATURE f ON f.PAIR_ID = d.PAIR_ID
+WHERE d.DECISION = 'AUTO_MATCH'
+  AND d.DECISION_PATH IN ('ID_MATCH', 'ID_MATCH_NAME_DIFFERS', 'ID_CONFLICT', 'ID_CONFLICT_REVIEW')
+  AND (   (f.NZBN_EQ = TRUE AND f.NZBN_SHARED_COUNT > 3)
+       OR (f.NZBN_EQ IS NULL AND f.COMPANY_NO_EQ = TRUE AND f.COMPANY_NO_SHARED_COUNT > 3));
 
 -- Test: review_not_in_queue -- every production REVIEW pair is in the queue.
 SELECT d.PAIR_ID, d.DECISION_PATH, d.SCORE
@@ -236,7 +249,16 @@ id_match_low_overlap_auto AS (
     JOIN CURATED.MATCH_FEATURE f ON f.PAIR_ID = d.PAIR_ID
     WHERE d.DECISION = 'AUTO_MATCH'
       AND d.DECISION_PATH IN ('ID_MATCH', 'ID_MATCH_NAME_DIFFERS', 'ID_CONFLICT', 'ID_CONFLICT_REVIEW')
-      AND f.NAME_TOKEN_JACCARD < 0.75
+      AND COALESCE(f.NAME_TOKEN_JACCARD, 0) < 0.75
+),
+auto_via_widely_shared_id AS (
+    SELECT d.PAIR_ID
+    FROM CURATED.MATCH_DECISION d
+    JOIN CURATED.MATCH_FEATURE f ON f.PAIR_ID = d.PAIR_ID
+    WHERE d.DECISION = 'AUTO_MATCH'
+      AND d.DECISION_PATH IN ('ID_MATCH', 'ID_MATCH_NAME_DIFFERS', 'ID_CONFLICT', 'ID_CONFLICT_REVIEW')
+      AND (   (f.NZBN_EQ = TRUE AND f.NZBN_SHARED_COUNT > 3)
+           OR (f.NZBN_EQ IS NULL AND f.COMPANY_NO_EQ = TRUE AND f.COMPANY_NO_SHARED_COUNT > 3))
 ),
 review_not_in_queue AS (
     SELECT d.PAIR_ID
@@ -268,6 +290,7 @@ UNION ALL SELECT 'fuzzy_auto_without_second_evidence',  COUNT(*) FROM fuzzy_auto
 UNION ALL SELECT 'estate_prefix_false_match',           COUNT(*) FROM estate_prefix_false_match
 UNION ALL SELECT 'auto_low_token_overlap',              COUNT(*) FROM auto_low_token_overlap
 UNION ALL SELECT 'id_match_low_overlap_auto',           COUNT(*) FROM id_match_low_overlap_auto
+UNION ALL SELECT 'auto_via_widely_shared_id',           COUNT(*) FROM auto_via_widely_shared_id
 UNION ALL SELECT 'review_not_in_queue',                 COUNT(*) FROM review_not_in_queue
 UNION ALL SELECT 'evidence_missing',                    COUNT(*) FROM evidence_missing
 UNION ALL SELECT 'weights_sum_check',                   COUNT(*) FROM weights_sum_check;

@@ -49,10 +49,17 @@ FROM CURATED.MATCH_FEATURE
 WHERE NAME_CORE_JW_REV NOT BETWEEN 0 AND 100;
 
 -- Test: jaccard_out_of_range -- word overlap is a share, so always 0-1
--- (NULL is allowed: a side has no name words).
+-- (NULL is checked separately by jaccard_null).
 SELECT PAIR_ID, NAME_TOKEN_JACCARD
 FROM CURATED.MATCH_FEATURE
 WHERE NAME_TOKEN_JACCARD NOT BETWEEN 0 AND 1;
+
+-- Test: jaccard_null -- every pair must have a word overlap (main name vs
+-- main name is always computed). A NULL would let 06's word-overlap gates
+-- be skipped, which is how differently named St John committees auto-merged.
+SELECT PAIR_ID
+FROM CURATED.MATCH_FEATURE
+WHERE NAME_TOKEN_JACCARD IS NULL;
 
 -- Test: eq_true_but_values_differ -- spot-check: PHONE_EQ = TRUE must mean the
 -- two cleaned phone numbers really are identical.
@@ -132,6 +139,10 @@ jaccard_out_of_range AS (
     SELECT PAIR_ID FROM CURATED.MATCH_FEATURE
     WHERE NAME_TOKEN_JACCARD NOT BETWEEN 0 AND 1
 ),
+jaccard_null AS (
+    SELECT PAIR_ID FROM CURATED.MATCH_FEATURE
+    WHERE NAME_TOKEN_JACCARD IS NULL
+),
 eq_true_but_values_differ AS (
     SELECT PAIR_ID FROM pair_sides
     WHERE PHONE_EQ AND L_PHONE <> R_PHONE
@@ -148,6 +159,7 @@ SELECT 'one_row_per_pair'           AS test_name, COUNT(*) AS failure_count FROM
 UNION ALL SELECT 'jw_out_of_range',            COUNT(*) FROM jw_out_of_range
 UNION ALL SELECT 'jw_rev_out_of_range',        COUNT(*) FROM jw_rev_out_of_range
 UNION ALL SELECT 'jaccard_out_of_range',       COUNT(*) FROM jaccard_out_of_range
+UNION ALL SELECT 'jaccard_null',               COUNT(*) FROM jaccard_null
 UNION ALL SELECT 'eq_true_but_values_differ',  COUNT(*) FROM eq_true_but_values_differ
 UNION ALL SELECT 'eq_not_null_when_missing',   COUNT(*) FROM eq_not_null_when_missing
 UNION ALL SELECT 'generic_email_used',         COUNT(*) FROM generic_email_used;

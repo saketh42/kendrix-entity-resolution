@@ -1,16 +1,21 @@
 # Data dictionary
 
-Every table, view and helper object built by `sql/01`–`07` and `sql/profiling/`,
+Every table, view and helper object built by `sql/01`–`08` and `sql/profiling/`,
 grouped by schema. Database `KENDRIX`.
 
 - The database and the four schemas are owned by **Terraform**. `sql/` files only
   create objects inside them.
-- `sql/` files run in numeric order; each one appends a row to `AUDIT.PIPELINE_RUN`.
+- `sql/` files run in numeric order; `sql/02`–`08` each append a row to
+  `AUDIT.PIPELINE_RUN`. `sql/01` and `sql/profiling/` do not write to it.
 - **Contract tables** are created empty by `sql/04` (so column names and types are
   agreed up front) and filled by a later step.
 - `TMP_*` tables are `TEMPORARY`: they exist only for the session that ran the file.
+- **Rule versions** (written to `AUDIT.PIPELINE_RUN.RULE_VERSION`): `std_v3` (03),
+  `block_v1` (04), `feat_v2` (05), `score_v5` (06), `surv_v1` (07).
 
-## RAW - data as received (all columns VARCHAR, never edited)
+## RAW - data as received (never edited)
+
+Source columns are all VARCHAR; `_LOADED_AT` is TIMESTAMP_NTZ.
 
 | Object | Type | Grain | Key columns | Purpose | Produced by |
 |---|---|---|---|---|---|
@@ -48,7 +53,16 @@ grouped by schema. Database `KENDRIX`.
 
 | Object | Type | Grain | Key columns | Purpose | Produced by |
 |---|---|---|---|---|---|
-| `AUDIT.PIPELINE_RUN` | Table | One row per pipeline step run | `RUN_ID`, `STEP` | Run log: start/end time, rows out, rule version, SUCCESS/FAIL, notes | Created by `sql/01_setup.sql`; every step `02`–`07` appends |
+| `AUDIT.PIPELINE_RUN` | Table | One row per pipeline step run | `RUN_ID`, `STEP` | Run log: start/end time, rows out, rule version, SUCCESS/FAIL, notes | Created by `sql/01_setup.sql`; steps `02`–`08` append (not `01` or the profiling script) |
 | `AUDIT.MATCH_EVIDENCE` | Table (contract) | One row per pair per feature with evidence | `PAIR_ID`, `FEATURE` | Evidence ledger behind every score: both values, similarity, weight, contribution | Created by `sql/04`, filled by `sql/06_matching.sql` |
 | `AUDIT.EXCEPTION_QUEUE` | Table (contract) | One row per exception: at most one per pair (from 06), or one per member record of a conflicting master (from 07) | `EXCEPTION_ID`; `PAIR_ID` or `RECORD_KEY` | Items that need a human decision: REVIEW pairs and shared-contact-only near matches (06), and member records of masters where chaining merged two different NZBNs (`CHAIN_NZBN_CONFLICT`, 07) | Created by `sql/04`, filled by `sql/06_matching.sql` and `sql/07_golden_record.sql` |
 | `AUDIT.DQ_PROFILE` | Table | One row per data-quality check per profiling run | `RUN_ID`, `SOURCE`, `CHECK_NAME` | Data-quality metrics for RAW (before) and STAGING (after cleaning); feeds `docs/data_quality_report.md` | `sql/profiling/data_quality_profile.sql` |
+
+## Evaluation - sql/08_evaluation.sql
+
+| Object | Type | Grain | Key columns | Purpose | Produced by |
+|---|---|---|---|---|---|
+| `CURATED.TRUTH_PAIR` | Table | One row per unordered pair of matchable records sharing a valid NZBN held by at most 3 records (1,142) | `LEFT_KEY`, `RIGHT_KEY` (`LEFT_KEY < RIGHT_KEY`) | The answer key, with `PAIR_ID` (NULL if blocking never generated the pair), `IN_CANDIDATES`, `FOUND_WITHOUT_NZBN`, fuzzy score and decision. Rebuilt each run | `sql/08_evaluation.sql` |
+| `CURATED.TMP_EVAL_PAIR` | Temporary table | One row per evaluable candidate pair: both sides have an NZBN, not found only by the NZBN block, not an umbrella pair | `PAIR_ID` | Pairs where a fuzzy prediction can be graded right or wrong | `sql/08_evaluation.sql` |
+| `AUDIT.EVALUATION_RESULT` | Table | One row per run / metric group / metric | `RUN_ID`, `METRIC_GROUP`, `METRIC` | `METRIC_GROUP`, `METRIC`, `VALUE`, `NOTE` (plus `EVALUATED_AT`, `RULE_VERSION`). Append-only history | `sql/08_evaluation.sql` |
+| `CURATED.V_EVAL_EXAMPLES` | View | One row per example: top 10 false positives and top 10 false negatives | `EXAMPLE_TYPE`, `EXAMPLE_RANK` | Names, fuzzy score, decision, top reasons and block types for each example | `sql/08_evaluation.sql` |

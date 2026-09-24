@@ -1,0 +1,24 @@
+name: CI
+
+# Static checks on every pull request and every push to main.
+# No Snowflake connection and no secrets: the SQL pipeline and its 51 tests
+# are run in Snowsight by the team (see README "How to run").
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Repository checks (tests per step, Snowflake SQL rules, no secrets)
+        run: python scripts/ci_checks.py

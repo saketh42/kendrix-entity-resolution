@@ -55,6 +55,14 @@ SELECT RECORD_KEY, NZBN, PHONE_CLEAN, EMAIL_CLEAN, POSTCODE
 FROM STAGING.ORGANISATION_STD
 WHERE NZBN = '' OR PHONE_CLEAN = '' OR EMAIL_CLEAN = '' OR POSTCODE = '';
 
+-- Test: placeholder_email_left -- the register's dummy emails (found by
+-- profiling) must be NULL, otherwise unrelated charities "share" an email.
+-- Literals are written out here, not taken from FN_IS_PLACEHOLDER_EMAIL, so
+-- the test checks the UDF independently.
+SELECT RECORD_KEY, EMAIL_CLEAN
+FROM STAGING.ORGANISATION_STD
+WHERE EMAIL_CLEAN IN ('nocharityemail@dia.govt.nz', 'noaddress@charities.govt.nz');
+
 -- Test: name_rules -- known inputs give the expected NAME_CLEAN and NAME_CORE,
 -- using the same UDFs the pipeline uses.
 SELECT t.INPUT_NAME, t.EXPECTED_CLEAN, t.EXPECTED_CORE,
@@ -123,6 +131,10 @@ empty_strings_left AS (
     SELECT RECORD_KEY FROM STAGING.ORGANISATION_STD
     WHERE NZBN = '' OR PHONE_CLEAN = '' OR EMAIL_CLEAN = '' OR POSTCODE = ''
 ),
+placeholder_email_left AS (
+    SELECT RECORD_KEY FROM STAGING.ORGANISATION_STD
+    WHERE EMAIL_CLEAN IN ('nocharityemail@dia.govt.nz', 'noaddress@charities.govt.nz')
+),
 name_rules AS (
     SELECT t.INPUT_NAME
     FROM VALUES
@@ -153,5 +165,6 @@ UNION ALL SELECT 'postcode_not_4_digits',  COUNT(*) FROM postcode_not_4_digits
 UNION ALL SELECT 'phone_non_digits',       COUNT(*) FROM phone_non_digits
 UNION ALL SELECT 'nzbn_not_13_digits',     COUNT(*) FROM nzbn_not_13_digits
 UNION ALL SELECT 'empty_strings_left',     COUNT(*) FROM empty_strings_left
+UNION ALL SELECT 'placeholder_email_left', COUNT(*) FROM placeholder_email_left
 UNION ALL SELECT 'name_rules',             COUNT(*) FROM name_rules
 UNION ALL SELECT 'phone_rules',            COUNT(*) FROM phone_rules;

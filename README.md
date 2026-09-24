@@ -1,5 +1,8 @@
 # Kendrix Entity Resolution
 
+> **[Open Live Dashboard →](https://app.snowflake.com/streamlit/gtwrsqt/fd19514/#/apps/umkziieyqtt3huvkpnon)**
+
+
 **UoA × dataengine Datathon 2026, Use case 2.** The same New Zealand organisation appears differently across registers. This project builds one trusted master record per organisation in Snowflake. Every match keeps its evidence, and uncertain cases go to a human review queue, so a regulator can see which records belong together and why.
 
 ## Results at a glance

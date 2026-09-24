@@ -40,6 +40,20 @@ ALTER TABLE CURATED.MATCH_FEATURE ADD COLUMN IF NOT EXISTS SAME_PARENT_CHARITY B
     COMMENT 'Same parent charity registration number but different registration numbers: related group members, NOT the same entity';
 ALTER TABLE CURATED.MATCH_FEATURE ADD COLUMN IF NOT EXISTS COMPUTED_AT TIMESTAMP_NTZ
     COMMENT 'When this feature row was computed';
+-- Jaro-Winkler gives a bonus for a shared start, so 'ESTATE OF ANDREW BLACK'
+-- vs 'ESTATE OF KENNETH NORTH' scores high on the prefix alone. Comparing the
+-- REVERSED names makes the (different) endings the prefix, which cancels that bonus.
+ALTER TABLE CURATED.MATCH_FEATURE ADD COLUMN IF NOT EXISTS NAME_CORE_JW_REV NUMBER(5,2)
+    COMMENT 'Jaro-Winkler of the REVERSED NAME_CORE values, 0-100; counters the prefix bias (ESTATE OF X vs ESTATE OF Y)';
+-- A trustee company or accountant's office is the registered address of many
+-- unrelated charities, so a shared address can be as weak as a shared admin email.
+ALTER TABLE CURATED.MATCH_FEATURE ADD COLUMN IF NOT EXISTS ADDRESS_SHARED_COUNT NUMBER
+    COMMENT 'Records with the same ADDRESS_LINE_CLEAN + POSTCODE, the larger of the two sides; NULL unless both sides have both';
+-- Share of distinct words the two names have in common. Catches names that
+-- share start AND end but differ in the key word (place, hapu, activity):
+-- 'NGATI TU HAPU' vs 'NGATI HAUA HAPU' = 2 shared of 4 distinct words = 0.5.
+ALTER TABLE CURATED.MATCH_FEATURE ADD COLUMN IF NOT EXISTS NAME_TOKEN_JACCARD NUMBER(5,2)
+    COMMENT 'Best word-overlap (Jaccard, 0-1) over all core names/alt names of the two sides: shared distinct words / all distinct words';
 
 -- -----------------------------------------------------------------------------
 -- 2) Rebuild the features: one row per candidate pair.
@@ -50,7 +64,8 @@ INSERT INTO CURATED.MATCH_FEATURE (
     PAIR_ID, NAME_JW, NAME_CORE_JW, ALT_NAME_JW, ADDRESS_JW,
     POSTCODE_EQ, CITY_EQ, PHONE_EQ, EMAIL_EQ, WEBSITE_EQ, NZBN_EQ, COMPANY_NO_EQ,
     EMAIL_SHARED_COUNT, PHONE_SHARED_COUNT, WEBSITE_SHARED_COUNT,
-    SAME_PARENT_CHARITY, RUN_ID, COMPUTED_AT
+    SAME_PARENT_CHARITY, RUN_ID, COMPUTED_AT,
+    NAME_CORE_JW_REV, ADDRESS_SHARED_COUNT, NAME_TOKEN_JACCARD
 )
 WITH
 -- Both records of every pair side by side (L_ = left record, R_ = right record).
@@ -97,6 +112,14 @@ website_counts AS (
     WHERE WEBSITE_DOMAIN IS NOT NULL
     GROUP BY WEBSITE_DOMAIN
 ),
+-- Address + postcode together, so '1 MAIN ST' in two different towns is not
+-- counted as one address. '|' keeps the two parts from running together.
+address_counts AS (
+    SELECT ADDRESS_LINE_CLEAN || '|' || POSTCODE AS VAL, COUNT(*) AS N
+    FROM STAGING.ORGANISATION_STD
+    WHERE ADDRESS_LINE_CLEAN IS NOT NULL AND POSTCODE IS NOT NULL
+    GROUP BY 1
+),
 
 -- Pairs where at least one side has alternative names (other/trading/former).
 -- ALT_NAMES is [] (not NULL) when there are none, hence ARRAY_SIZE. Pairs with
@@ -126,19 +149,58 @@ record_names AS (
 -- Best similarity between ANY name of the left record and ANY name of the right
 -- record, so a former name can match the other record's current name.
 -- The cross product is small: most records have 1 to 3 names.
+-- Each combination takes the LOWER of forward and reversed Jaro-Winkler (same
+-- prefix-bias protection as NAME_CORE_JW_REV), so a shared start alone cannot
+-- make two names look alike through the alt-name path either.
 alt_name_best AS (
     SELECT pa.PAIR_ID,
-           MAX(JAROWINKLER_SIMILARITY(ln.NM, rn.NM)) AS ALT_NAME_JW
+           MAX(LEAST(JAROWINKLER_SIMILARITY(ln.NM, rn.NM),
+                     JAROWINKLER_SIMILARITY(REVERSE(ln.NM), REVERSE(rn.NM)))) AS ALT_NAME_JW
     FROM pairs_with_alt pa
     JOIN record_names ln ON ln.RECORD_KEY = pa.LEFT_KEY
     JOIN record_names rn ON rn.RECORD_KEY = pa.RIGHT_KEY
     GROUP BY pa.PAIR_ID
 ),
 
+-- Word sets of every core name of every record in a pair: NAME_CORE (or
+-- NAME_CLEAN if the core is empty) plus the core of each alt name (same
+-- FN_NAME_CORE rule as sql/04), so legal-form words like 'TRUST' or
+-- 'INCORPORATED' do not count as shared words. ARRAY_DISTINCT once here, so
+-- each word counts once.
+record_word_sets AS (
+    SELECT s.RECORD_KEY, ARRAY_DISTINCT(SPLIT(COALESCE(s.NAME_CORE, s.NAME_CLEAN), ' ')) AS WORDS
+    FROM STAGING.ORGANISATION_STD s
+    WHERE COALESCE(s.NAME_CORE, s.NAME_CLEAN) IS NOT NULL
+      AND s.RECORD_KEY IN (SELECT LEFT_KEY FROM pairs UNION SELECT RIGHT_KEY FROM pairs)
+    UNION ALL
+    SELECT s.RECORD_KEY, ARRAY_DISTINCT(SPLIT(STAGING.FN_NAME_CORE(f.VALUE::VARCHAR), ' '))
+    FROM STAGING.ORGANISATION_STD s,
+         LATERAL FLATTEN(INPUT => s.ALT_NAMES) f
+    WHERE f.VALUE IS NOT NULL
+      AND STAGING.FN_NAME_CORE(f.VALUE::VARCHAR) IS NOT NULL
+      AND s.RECORD_KEY IN (SELECT LEFT_KEY FROM pairs UNION SELECT RIGHT_KEY FROM pairs)
+),
+
+-- Jaccard = shared distinct words / all distinct words of the two names, 0-1.
+-- Best over every name combination, like ALT_NAME_JW.
+name_jaccard AS (
+    SELECT p.PAIR_ID,
+           MAX(ARRAY_SIZE(ARRAY_INTERSECTION(lw.WORDS, rw.WORDS))
+               / NULLIF(ARRAY_SIZE(ARRAY_DISTINCT(ARRAY_CAT(lw.WORDS, rw.WORDS))), 0)) AS NAME_TOKEN_JACCARD
+    FROM pairs p
+    JOIN record_word_sets lw ON lw.RECORD_KEY = p.LEFT_KEY
+    JOIN record_word_sets rw ON rw.RECORD_KEY = p.RIGHT_KEY
+    GROUP BY p.PAIR_ID
+),
+
 features AS (
     SELECT
         p.PAIR_ID,
         p.L_EMAIL, p.L_PHONE, p.L_WEB,
+        -- NULL unless the side has both parts (then no address count is joined).
+        p.L_ADDR || '|' || p.L_PC                   AS L_ADDR_KEY,
+        p.R_ADDR || '|' || p.R_PC                   AS R_ADDR_KEY,
+        JAROWINKLER_SIMILARITY(REVERSE(p.L_CORE), REVERSE(p.R_CORE)) AS NAME_CORE_JW_REV,
         -- JAROWINKLER_SIMILARITY returns 0-100 and NULL if either input is NULL,
         -- so a missing address gives ADDRESS_JW = NULL (no evidence), not 0.
         JAROWINKLER_SIMILARITY(p.L_NAME, p.R_NAME)  AS NAME_JW,
@@ -146,6 +208,7 @@ features AS (
         -- 'X Charitable Trust' score high here even when NAME_JW is lower.
         JAROWINKLER_SIMILARITY(p.L_CORE, p.R_CORE)  AS NAME_CORE_JW,
         a.ALT_NAME_JW,
+        ROUND(j.NAME_TOKEN_JACCARD, 2)              AS NAME_TOKEN_JACCARD,
         JAROWINKLER_SIMILARITY(p.L_ADDR, p.R_ADDR)  AS ADDRESS_JW,
         -- Plain '=' on purpose: SQL equality already returns NULL when either
         -- side is NULL, which is exactly "no evidence". Do NOT wrap these in
@@ -174,6 +237,7 @@ features AS (
         (p.L_PARENT = p.R_PARENT AND p.L_REG <> p.R_REG) AS SAME_PARENT_CHARITY
     FROM pairs p
     LEFT JOIN alt_name_best a ON a.PAIR_ID = p.PAIR_ID
+    LEFT JOIN name_jaccard  j ON j.PAIR_ID = p.PAIR_ID
 )
 
 -- Shared counts are only filled when the pair is EQUAL on that value (the EQ
@@ -188,11 +252,21 @@ SELECT
     wc.N                                            AS WEBSITE_SHARED_COUNT,
     f.SAME_PARENT_CHARITY,
     $RUN_ID::VARCHAR                                AS RUN_ID,
-    CURRENT_TIMESTAMP()::TIMESTAMP_NTZ              AS COMPUTED_AT
+    CURRENT_TIMESTAMP()::TIMESTAMP_NTZ              AS COMPUTED_AT,
+    f.NAME_CORE_JW_REV,
+    -- Unlike the contact counts this is filled whether or not the addresses
+    -- are equal (ADDRESS_JW is a similarity, not an equality). The LARGER side
+    -- is used: if either record sits at a busy trustee address, comparing
+    -- addresses says little about identity.
+    IFF(la.N IS NOT NULL AND ra.N IS NOT NULL, GREATEST(la.N, ra.N), NULL)
+                                                    AS ADDRESS_SHARED_COUNT,
+    f.NAME_TOKEN_JACCARD
 FROM features f
 LEFT JOIN email_counts   ec ON ec.VAL = f.L_EMAIL AND f.EMAIL_EQ
 LEFT JOIN phone_counts   pc ON pc.VAL = f.L_PHONE AND f.PHONE_EQ
-LEFT JOIN website_counts wc ON wc.VAL = f.L_WEB   AND f.WEBSITE_EQ;
+LEFT JOIN website_counts wc ON wc.VAL = f.L_WEB   AND f.WEBSITE_EQ
+LEFT JOIN address_counts la ON la.VAL = f.L_ADDR_KEY
+LEFT JOIN address_counts ra ON ra.VAL = f.R_ADDR_KEY;
 
 -- -----------------------------------------------------------------------------
 -- 3) Audit log row. SUCCESS only if every candidate pair got exactly one

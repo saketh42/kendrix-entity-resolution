@@ -13,3 +13,37 @@ terraform/*.tfvars.json
 *.p8
 *_key
 *.key
+
+# --- Data: never commit full datasets; small fixtures in data/sample/*.csv are allowed
+data/*
+!data/sample/
+data/sample/*
+!data/sample/.gitkeep
+!data/sample/*.csv
+*.xls
+*.xlsx
+*.zip
+*.shp
+*.dbf
+*.shx
+# --- Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+# --- Local config / secrets
+.env
+.env.*
+.snowflake/
+/config.toml
+connections.toml
+*.pem
+# --- Terraform plan files
+terraform/tfplan
+*.tfplan
+# --- OS / AI local files
+.DS_Store
+Thumbs.db
+CLAUDE.local.md
+.claude/settings.local.json

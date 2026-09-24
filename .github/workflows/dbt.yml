@@ -1,0 +1,64 @@
+name: dbt
+
+on:
+  pull_request:
+    paths:
+      - "dbt/**"
+      - ".github/workflows/dbt.yml"
+
+  push:
+    branches:
+      - main
+    paths:
+      - "dbt/**"
+      - ".github/workflows/dbt.yml"
+
+jobs:
+  dbt:
+    runs-on: ubuntu-latest
+
+    env:
+      DBT_SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      DBT_SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+      DBT_SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dbt
+        run: pip install dbt-snowflake
+
+      - name: Create dbt profile
+        shell: bash
+        run: |
+          mkdir -p ~/.dbt
+
+          cat > ~/.dbt/profiles.yml <<EOF
+          kendrix:
+            target: ci
+            outputs:
+              ci:
+                type: snowflake
+                account: $DBT_SNOWFLAKE_ACCOUNT
+                user: $DBT_SNOWFLAKE_USER
+                password: $DBT_SNOWFLAKE_PASSWORD
+                role: KENDRIX_DEVELOPER
+                database: KENDRIX
+                warehouse: TEAM_WH
+                schema: STAGING
+                threads: 4
+          EOF
+
+      - name: dbt debug
+        working-directory: dbt/kendrix
+        run: dbt debug
+
+      - name: dbt build
+        working-directory: dbt/kendrix
+        run: dbt build
